@@ -125,7 +125,7 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
         unknown_kwargs = set(kwargs) - _IGNORABLE_FORWARD_KWARGS
         assert len(unknown_kwargs) == 0, f"forward got unexpected kwargs: {unknown_kwargs}"
 
-        output = super().forward(
+        return super().forward(
             input_ids=input_ids,
             cache_params=cache_params,
             attention_mask=attention_mask,
@@ -133,17 +133,8 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
             inputs_embeds=inputs_embeds,
             labels=labels,
             use_cache=use_cache,
+            logits_to_keep=0 if logits_to_keep is None else logits_to_keep,
         )
-
-        # TRL and friends pass logits_to_keep to avoid materializing prompt logits; we slice
-        # after the fact, which keeps semantics (memory optimization can come later)
-        if isinstance(logits_to_keep, int):
-            if logits_to_keep > 0 and output.logits is not None:
-                output.logits = output.logits[:, -logits_to_keep:]
-        elif logits_to_keep is not None:
-            output.logits = output.logits[:, logits_to_keep]
-
-        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -163,6 +154,9 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
             "attention_mask": attention_mask,
             "cache_params": cache_params,
             "use_cache": use_cache,
+            # sampling only reads the last position; saves prompt_length x vocab_size logits
+            # during prefill
+            "logits_to_keep": 1,
         }
 
     def _update_model_kwargs_for_generation(
