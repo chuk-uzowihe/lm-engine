@@ -71,6 +71,14 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
         super().__init__(config, **kwargs)
         self.generation_config = GenerationConfig.from_model_config(config)
 
+    def add_model_tags(self, tags) -> None:
+        """hub-metadata no-op (PreTrainedModel API expected by TRL)"""
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        # PreTrainedModel API expected by TRL; mirrors its definition
+        return any(getattr(module, "gradient_checkpointing", False) for module in self.modules())
+
     # GenerationMixin expects these; nn.Module doesn't provide them
     @property
     def device(self) -> torch.device:
