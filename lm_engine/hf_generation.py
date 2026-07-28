@@ -11,6 +11,8 @@ import torch
 from transformers import GenerationConfig
 from transformers.generation import GenerationMixin
 
+from .modeling_utils.mlp_blocks.mlp.module import MLP
+from .modeling_utils.mlp_blocks.mlp.utils import interleave_up_gate_tensor_for_mlp
 from .models import GPTBaseForCausalLM
 
 
@@ -22,6 +24,31 @@ _CONFIG_BACKFILL = {
     "use_depth_scaled_init": False,
     "tie_word_embeddings": True,
 }
+
+
+@torch.no_grad()
+def _interleave_legacy_glu_weights(model: GPTBaseForCausalLM) -> None:
+    """Convert GLU weights from checkpoints that predate #465 (support only interleaved_weights).
+
+    Legacy c_fc stores [up; gate] as concatenated halves; current code reads even rows as gate
+    and odd rows as up.
+    """
+
+    for block in model.transformer.h.values():
+        mlp = block.mlp_block
+
+        if not getattr(mlp, "is_glu", False):
+            continue
+
+        if not isinstance(mlp, MLP):
+            raise NotImplementedError(
+                "GLU weight interleaving for legacy checkpoints is only implemented for dense MLP "
+                f"blocks, found {type(mlp).__name__} (needed for the MoE 7B checkpoints)"
+            )
+
+        for tensor in [mlp.c_fc.weight] + ([mlp.c_fc.bias] if mlp.c_fc.bias is not None else []):
+            u, g = tensor.chunk(2, dim=0)
+            tensor.copy_(interleave_up_gate_tensor_for_mlp(u, g, dim=0))
 
 # kwargs passed by transformers/TRL that have no lm-engine equivalent and can be dropped
 # without changing forward's semantics
@@ -62,14 +89,23 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
                 pretrained_model_name_or_path, allow_patterns=["*.json", "*.safetensors", "tokenizer*"]
             )
 
+        config_dict = json.load(open(os.path.join(pretrained_model_name_or_path, "config.json")))
+        # missing schema fields mean the checkpoint was exported before the config refactor
+        # (#478) and therefore also before the interleaved-weights breaking change (#465)
+        is_legacy_checkpoint = any(key not in config_dict for key in _CONFIG_BACKFILL)
+
         if "config" not in kwargs:
-            config_dict = json.load(open(os.path.join(pretrained_model_name_or_path, "config.json")))
             for key, value in _CONFIG_BACKFILL.items():
                 config_dict.setdefault(key, value)
 
             kwargs["config"] = cls.config_class.from_dict(config_dict)
 
-        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        model = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        if is_legacy_checkpoint:
+            _interleave_legacy_glu_weights(model)
+
+        return model
 
     def forward(
         self,

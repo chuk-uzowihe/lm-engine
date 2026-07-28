@@ -2,11 +2,17 @@
 # Copyright (c) 2026, Mayank Mishra
 # **************************************************
 
+import json
+import os
+import tempfile
+
 import pytest
 import torch
 
-from lm_engine.hf_generation import HFGPTBaseForCausalLM
+from lm_engine.hf_generation import _CONFIG_BACKFILL, HFGPTBaseForCausalLM
 from lm_engine.models import GPTBaseConfig, GPTBaseForCausalLM
+from lm_engine.modeling_utils.mlp_blocks.mlp.utils import split_up_gate_tensor_for_mlp
+from lm_engine.utils import SafeTensorsWeightsManager
 
 from .utils import get_dense_test_config, skip_test_if_device_unavailable
 
@@ -124,6 +130,46 @@ def test_hf_sampled_generate_matches_native(device: torch.device) -> None:
     )
 
     torch.testing.assert_close(hf_output, native_output)
+
+
+def test_from_pretrained_loads_legacy_checkpoint() -> None:
+    """Checkpoints exported before #465/#478 (like all open-lm-engine hub checkpoints) lack the
+    new config fields and store GLU weights as [up; gate] halves instead of interleaved.
+    from_pretrained must backfill the config and re-interleave the weights."""
+
+    torch.manual_seed(42)
+    config_dict = get_hybrid_m2rnn_test_config().to_dict()
+    config_dict["tie_word_embeddings"] = True
+    for mlp_block in config_dict["mlp_blocks"]:
+        mlp_block["activation_function"] = "swiglu"  # the released checkpoints use GLU MLPs
+    model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
+    model.eval()
+
+    torch.manual_seed(0)
+    input_ids = torch.randint(3, model.config.vocab_size, (2, 8))
+    with torch.no_grad():
+        expected_logits = model(input_ids=input_ids).logits
+
+    state_dict = model.state_dict()
+    for name in list(state_dict):
+        if name.endswith("mlp_block.c_fc.weight"):
+            u, g = split_up_gate_tensor_for_mlp(state_dict[name], dim=0)
+            state_dict[name] = torch.cat([u, g], dim=0)
+
+    for key in _CONFIG_BACKFILL:
+        del config_dict[key]
+
+    with tempfile.TemporaryDirectory() as save_directory:
+        json.dump(config_dict, open(os.path.join(save_directory, "config.json"), "w"))
+        SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
+
+        loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
+
+    loaded_model.eval()
+    with torch.no_grad():
+        loaded_logits = loaded_model(input_ids=input_ids).logits
+
+    torch.testing.assert_close(loaded_logits, expected_logits)
 
 
 @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
