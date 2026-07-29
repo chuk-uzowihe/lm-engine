@@ -12,6 +12,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from ....dtensors import dtensor_to_tensor, tensor_to_dtensor
 from ....enums import Kernel
 from ....kernels import is_kernel_allowed
+from ....routing_replay import get_active_routing_replay, restricted_router_weights
 from ....loss import add_aux_loss
 from ....parallel import ProcessGroupManager
 from ....parameter import mark_parameter_as_mup_learning_rate
@@ -232,6 +233,15 @@ class MoE(DTensorModule):
             router_weights = F.softmax(router_logits.float(), dim=-1)
             router_weights = router_weights.type_as(x)
             router_weights, selected_experts = self._get_topk(router_weights)
+
+        # rollout routing replay (R3): record the selection, or override it with the rollout's
+        # selection and re-weight via a softmax of the current logits over that expert set
+        routing_replay = get_active_routing_replay()
+        if routing_replay is not None:
+            replayed = routing_replay.observe(self, router_logits, selected_experts)
+            if replayed is not None:
+                selected_experts = replayed
+                router_weights = restricted_router_weights(router_logits, selected_experts).type_as(x)
 
         return router_logits, router_weights, selected_experts
 
