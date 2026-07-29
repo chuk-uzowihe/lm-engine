@@ -14,6 +14,11 @@ from lm_engine.models import GPTBaseConfig, GPTBaseForCausalLM
 from lm_engine.modeling_utils.mlp_blocks.mlp.utils import split_up_gate_tensor_for_mlp
 from lm_engine.utils import SafeTensorsWeightsManager
 
+
+def _deinterleave(tensor, dim: int):
+    u, g = split_up_gate_tensor_for_mlp(tensor, dim=dim)
+    return torch.cat([u, g], dim=dim)
+
 from .utils import get_dense_test_config, skip_test_if_device_unavailable
 
 
@@ -158,6 +163,67 @@ def test_from_pretrained_loads_legacy_checkpoint() -> None:
 
     for key in _CONFIG_BACKFILL:
         del config_dict[key]
+
+    with tempfile.TemporaryDirectory() as save_directory:
+        json.dump(config_dict, open(os.path.join(save_directory, "config.json"), "w"))
+        SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
+
+        loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
+
+    loaded_model.eval()
+    with torch.no_grad():
+        loaded_logits = loaded_model(input_ids=input_ids).logits
+
+    torch.testing.assert_close(loaded_logits, expected_logits)
+
+
+def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
+    """The 7B MoE checkpoints carry pre-#465 per-block interleave flags: routed experts were
+    exported interleaved (use_interleaved_weights: true) while shared experts were not (flag
+    absent = false). from_pretrained must pop the removed flags and convert exactly the
+    tensors they mark as concatenated."""
+
+    torch.manual_seed(42)
+    config_dict = get_hybrid_m2rnn_test_config().to_dict()
+    config_dict["tie_word_embeddings"] = True
+    config_dict["router_aux_loss_coef"] = 0.001
+    config_dict["mlp_blocks"] = [
+        {
+            "mlp_type": "MoE",
+            "activation_function": "swiglu",
+            "add_bias": False,
+            "intermediate_size": 16,
+            "shared_intermediate_size": 32,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "normalized_topk": True,
+            "shared_expert_gating": False,
+            "dropout": 0,
+        }
+        for _ in range(len(config_dict["sequence_mixer_blocks"]))
+    ]
+    model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
+    model.eval()
+
+    torch.manual_seed(0)
+    input_ids = torch.randint(3, model.config.vocab_size, (2, 8))
+    with torch.no_grad():
+        expected_logits = model(input_ids=input_ids).logits
+
+    # block 0 mimics the 7B checkpoints (routed already interleaved); the rest are fully
+    # legacy — covers both flag values and both tensor layouts (3D routed dim=1, 2D shared dim=0)
+    state_dict = model.state_dict()
+    for name in list(state_dict):
+        if name.endswith("mlp_block.c_fc.weight") and not name.startswith("transformer.h.0."):
+            state_dict[name] = _deinterleave(state_dict[name], dim=1)
+        elif name.endswith("mlp_block.c_fc_shared.weight"):
+            state_dict[name] = _deinterleave(state_dict[name], dim=0)
+
+    for key in _CONFIG_BACKFILL:
+        del config_dict[key]
+    for i, mlp_block in enumerate(config_dict["mlp_blocks"]):
+        mlp_block["use_interleaved_weights"] = i == 0
+        # use_interleaved_weights_for_shared_experts stays absent, like the released checkpoints
 
     with tempfile.TemporaryDirectory() as save_directory:
         json.dump(config_dict, open(os.path.join(save_directory, "config.json"), "w"))
