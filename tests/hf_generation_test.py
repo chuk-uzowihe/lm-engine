@@ -177,6 +177,31 @@ def test_from_pretrained_loads_legacy_checkpoint() -> None:
     torch.testing.assert_close(loaded_logits, expected_logits)
 
 
+def test_from_pretrained_keeps_decay_gate_params_fp32() -> None:
+    """SoftplusDecayGate declares A_log/dt_bias fp32; loading in bf16 must not downcast them
+    (the blanket model.to(dtype) in from_pretrained otherwise does)."""
+
+    torch.manual_seed(42)
+    config_dict = get_hybrid_m2rnn_test_config().to_dict()
+    config_dict["tie_word_embeddings"] = True
+    model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
+
+    with tempfile.TemporaryDirectory() as save_directory:
+        model.save_pretrained(save_directory)
+        loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory, dtype=torch.bfloat16)
+
+    assert loaded_model.transformer.wte.weight.dtype == torch.bfloat16
+    for name, param in loaded_model.named_parameters():
+        if "decay_gate" in name:
+            assert param.dtype == torch.float32, name
+
+    # mixed dtypes must survive a no-autocast forward (the generation path)
+    loaded_model.eval()
+    with torch.no_grad():
+        logits = loaded_model(input_ids=torch.randint(3, 128, (1, 8))).logits
+    assert torch.isfinite(logits.float()).all()
+
+
 def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
     """The 7B MoE checkpoints carry pre-#465 per-block interleave flags: routed experts were
     exported interleaved (use_interleaved_weights: true) while shared experts were not (flag

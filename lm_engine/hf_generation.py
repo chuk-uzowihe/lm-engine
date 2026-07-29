@@ -14,6 +14,7 @@ from transformers.generation import GenerationMixin
 from .modeling_utils.mlp_blocks.mlp.module import MLP
 from .modeling_utils.mlp_blocks.mlp.utils import interleave_up_gate_tensor_for_mlp
 from .modeling_utils.mlp_blocks.moe.module import MoE
+from .modeling_utils.softplus_decay_gate import SoftplusDecayGate
 from .models import GPTBaseForCausalLM
 
 
@@ -34,6 +35,19 @@ _LEGACY_INTERLEAVE_KEYS = ("use_interleaved_weights", "use_interleaved_weights_f
 def _interleave(tensor: torch.Tensor, dim: int) -> None:
     u, g = tensor.chunk(2, dim=dim)
     tensor.copy_(interleave_up_gate_tensor_for_mlp(u, g, dim=dim))
+
+
+@torch.no_grad()
+def _restore_declared_dtypes(model: GPTBaseForCausalLM) -> None:
+    """SoftplusDecayGate declares A_log/dt_bias as fp32 (their values live in softplus/exp
+    ranges where bf16 loses real precision), but from_pretrained's blanket model.to(dtype)
+    downcasts them. Restore fp32 storage; the module's forward already upcasts internally,
+    so mixed dtypes are safe in every path including no-autocast generation."""
+
+    for module in model.modules():
+        if isinstance(module, SoftplusDecayGate):
+            module.A_log.data = module.A_log.data.float()
+            module.dt_bias.data = module.dt_bias.data.float()
 
 
 @torch.no_grad()
@@ -141,6 +155,8 @@ class HFGPTBaseForCausalLM(GenerationMixin, GPTBaseForCausalLM):
 
         if is_legacy_checkpoint:
             _interleave_legacy_glu_weights(model, interleave_flags)
+
+        _restore_declared_dtypes(model)
 
         return model
 
