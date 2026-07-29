@@ -17,6 +17,7 @@ authors = [
 dependencies = [
     "datasets==5.0.0",
     "gitpython==3.1.50",
+    "math-verify>=0.9.0",
     "multi-storage-client[google-cloud-storage]==0.51.0",
     "ninja==1.13.0",
     "numpy==2.5.1",
