@@ -251,7 +251,11 @@ class ProcessGroupManager:
 
     @staticmethod
     def is_initialized() -> bool:
-        return torch.distributed.is_initialized()
+        # torch.distributed being initialized is not enough: external launchers (accelerate /
+        # torchrun driving the HF Trainer) initialize the default process group without ever
+        # constructing this class, and every caller pairs this check with a mesh query that
+        # would dereference an unbuilt mesh.
+        return torch.distributed.is_initialized() and _DENSE_MESH.mesh is not None
 
     @staticmethod
     def get_dense_mesh() -> DeviceMesh:
