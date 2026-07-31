@@ -4,6 +4,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -274,3 +276,66 @@ def test_logits_to_keep(device: torch.device) -> None:
         sliced_logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=3).logits
 
     torch.testing.assert_close(sliced_logits, full_logits[:, -3:])
+
+
+def test_moe_training_forward_survives_external_torch_distributed() -> None:
+    """External launchers (accelerate/torchrun driving the HF Trainer) initialize
+    torch.distributed without ever constructing ProcessGroupManager. The MoE switch loss's
+    data-parallel guard used to take ProcessGroupManager.is_initialized() as license to query
+    the data-parallel mesh, dereferencing a mesh that was never built. Runs in a subprocess
+    because torch.distributed state is process-global."""
+
+    script = """
+import torch
+import torch.distributed
+
+torch.distributed.init_process_group(backend="gloo")
+
+from lm_engine.parallel import ProcessGroupManager
+
+assert not ProcessGroupManager.is_initialized(), "meshes were never built"
+
+from lm_engine.hf_generation import HFGPTBaseForCausalLM
+from lm_engine.models import GPTBaseConfig
+
+m2rnn_block = {
+    "sequence_mixer_type": "m2rnn",
+    "k_head_dim": 8, "v_head_dim": 8,
+    "num_q_heads": 1, "num_k_heads": 1, "num_v_heads": 4,
+    "num_f_heads": 4, "num_g_heads": 4, "num_weight_heads": 4,
+    "use_residual": True, "kernel_size": 4, "activation_function": "silu",
+    "add_bias": False, "gradient_clipping": 1.0, "normalization_function": "rmsnorm",
+    "A_init_min": 0, "A_init_max": 16,
+    "dt_init_min": 0.001, "dt_init_max": 0.1, "dt_init_floor": 0.0001,
+}
+moe_block = {
+    "mlp_type": "MoE", "activation_function": "swiglu", "add_bias": False,
+    "intermediate_size": 16, "shared_intermediate_size": 32, "num_experts": 4,
+    "num_experts_per_tok": 2, "normalized_topk": True, "shared_expert_gating": False,
+    "dropout": 0,
+}
+config = GPTBaseConfig(
+    vocab_size=128, max_position_embeddings=64, hidden_size=32, num_layers=2,
+    position_embedding_type="nope", normalization_function="rmsnorm", layer_norm_epsilon=1e-5,
+    embedding_dropout=0, initializer_range=0.02, use_cache=True, rope_theta=10000,
+    rope_scaling=None, init_method="normal", embedding_init_method="normal",
+    use_depth_scaled_init=False, rope_dim=None, tie_word_embeddings=True,
+    router_aux_loss_coef=0.001,
+    bos_token_id=0, eos_token_id=1, pad_token_id=2,
+    m_emb=None, m_width=None, m_residual=None,
+    sequence_mixer_blocks=[m2rnn_block] * 2, mlp_blocks=[moe_block] * 2,
+)
+
+model = HFGPTBaseForCausalLM(config)
+model.train()
+input_ids = torch.randint(3, config.vocab_size, (2, 16))
+loss = model(input_ids=input_ids, labels=input_ids).loss
+assert torch.isfinite(loss), f"non-finite loss {loss}"
+"""
+
+    env = os.environ.copy()
+    env.update({"MASTER_ADDR": "localhost", "MASTER_PORT": "29513", "WORLD_SIZE": "1", "RANK": "0"})
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300, check=False
+    )
+    assert result.returncode == 0, f"subprocess failed:\n{result.stdout}\n{result.stderr}"
