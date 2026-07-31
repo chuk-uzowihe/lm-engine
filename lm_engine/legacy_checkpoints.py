@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from .modeling_utils.mlp_blocks.mlp.module import MLP
 from .modeling_utils.mlp_blocks.mlp.utils import interleave_up_gate_tensor_for_mlp
-from .modeling_utils.mlp_blocks.moe.module import MoE
 from .models import GPTBaseForCausalLM
 
 
@@ -75,20 +73,16 @@ def interleave_legacy_glu_weights(model: GPTBaseForCausalLM, interleave_flags: l
         if not getattr(mlp, "is_glu", False):
             continue
 
-        if isinstance(mlp, MLP):
-            if not experts_interleaved:
-                _interleave(mlp.c_fc.weight, dim=0)
-                if mlp.c_fc.bias is not None:
-                    _interleave(mlp.c_fc.bias, dim=0)
-        elif isinstance(mlp, MoE):
-            if not experts_interleaved:
-                # routed experts: (num_experts, 2 * intermediate, hidden)
-                _interleave(mlp.c_fc.weight, dim=1)
-                if mlp.c_fc.bias is not None:
-                    _interleave(mlp.c_fc.bias, dim=1)
-            if getattr(mlp, "c_fc_shared", None) is not None and not shared_interleaved:
-                _interleave(mlp.c_fc_shared.weight, dim=0)
-                if mlp.c_fc_shared.bias is not None:
-                    _interleave(mlp.c_fc_shared.bias, dim=0)
-        else:
-            raise NotImplementedError(f"unknown mlp block type {type(mlp).__name__}")
+        # MoE routed-expert tensors are 3D (num_experts, 2 * intermediate, hidden) with the
+        # fused-GLU axis at dim 1; MLP and shared-expert tensors carry it at dim 0. Biases
+        # have one fewer dim, so weight.ndim - 2 addresses the same axis in both.
+        for linear, interleaved in (
+            (mlp.c_fc, experts_interleaved),
+            (getattr(mlp, "c_fc_shared", None), shared_interleaved),
+        ):
+            if linear is None or interleaved:
+                continue
+            dim = linear.weight.ndim - 2
+            _interleave(linear.weight, dim=dim)
+            if linear.bias is not None:
+                _interleave(linear.bias, dim=dim)
