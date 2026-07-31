@@ -10,18 +10,19 @@ import tempfile
 
 import pytest
 import torch
+from torch.testing import assert_close
 
 from lm_engine.hf_generation import _CONFIG_BACKFILL, HFGPTBaseForCausalLM
 from lm_engine.models import GPTBaseConfig, GPTBaseForCausalLM
 from lm_engine.modeling_utils.mlp_blocks.mlp.utils import split_up_gate_tensor_for_mlp
 from lm_engine.utils import SafeTensorsWeightsManager
 
+from .utils import assert_equal_tensors, get_dense_test_config, skip_test_if_device_unavailable
+
 
 def _deinterleave(tensor, dim: int):
     u, g = split_up_gate_tensor_for_mlp(tensor, dim=dim)
     return torch.cat([u, g], dim=dim)
-
-from .utils import get_dense_test_config, skip_test_if_device_unavailable
 
 
 def get_hybrid_m2rnn_test_config(num_layers: int = 4) -> GPTBaseConfig:
@@ -56,6 +57,30 @@ def get_hybrid_m2rnn_test_config(num_layers: int = 4) -> GPTBaseConfig:
         config_dict["sequence_mixer_blocks"][i] if i == 1 else m2rnn_block for i in range(num_layers)
     ]
 
+    return GPTBaseConfig(**config_dict)
+
+
+def get_moe_test_config(num_layers: int = 4) -> GPTBaseConfig:
+    """hybrid m2rnn test config with MoE mlp blocks, shaped like the released 7B checkpoints"""
+
+    config_dict = get_hybrid_m2rnn_test_config(num_layers).to_dict()
+    config_dict["tie_word_embeddings"] = True
+    config_dict["router_aux_loss_coef"] = 0.001
+    config_dict["mlp_blocks"] = [
+        {
+            "mlp_type": "MoE",
+            "activation_function": "swiglu",
+            "add_bias": False,
+            "intermediate_size": 16,
+            "shared_intermediate_size": 32,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "normalized_topk": True,
+            "shared_expert_gating": False,
+            "dropout": 0,
+        }
+        for _ in range(num_layers)
+    ]
     return GPTBaseConfig(**config_dict)
 
 
@@ -95,7 +120,7 @@ def test_incremental_decode_matches_full_forward(device: torch.device) -> None:
             output = model(input_ids=input_ids[:, t : t + 1], cache_params=output.cache_params, use_cache=True)
             step_logits.append(output.logits)
 
-    torch.testing.assert_close(torch.cat(step_logits, dim=1), full_logits, rtol=2e-4, atol=2e-4)
+    assert_close(torch.cat(step_logits, dim=1), full_logits, rtol=2e-4, atol=2e-4)
 
 
 @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
@@ -111,8 +136,7 @@ def test_hf_greedy_generate_matches_native(device: torch.device, left_pad: int) 
     native_output = GPTBaseForCausalLM.generate(
         model, input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=16, temperature=0
     )
-
-    torch.testing.assert_close(hf_output, native_output)
+    assert_equal_tensors(hf_output, native_output, exact_match=True)
 
 
 @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
@@ -136,7 +160,7 @@ def test_hf_sampled_generate_matches_native(device: torch.device) -> None:
         model, input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=16, temperature=0.8, top_k=5
     )
 
-    torch.testing.assert_close(hf_output, native_output)
+    assert_equal_tensors(hf_output, native_output, exact_match=True)
 
 
 def test_from_pretrained_loads_legacy_checkpoint() -> None:
@@ -152,6 +176,7 @@ def test_from_pretrained_loads_legacy_checkpoint() -> None:
     model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
     model.eval()
 
+    # re-seed so the inputs don't depend on how many RNG draws model construction consumed
     torch.manual_seed(0)
     input_ids = torch.randint(3, model.config.vocab_size, (2, 8))
     with torch.no_grad():
@@ -160,14 +185,14 @@ def test_from_pretrained_loads_legacy_checkpoint() -> None:
     state_dict = model.state_dict()
     for name in list(state_dict):
         if name.endswith("mlp_block.c_fc.weight"):
-            u, g = split_up_gate_tensor_for_mlp(state_dict[name], dim=0)
-            state_dict[name] = torch.cat([u, g], dim=0)
+            state_dict[name] = _deinterleave(state_dict[name], dim=0)
 
     for key in _CONFIG_BACKFILL:
         del config_dict[key]
 
     with tempfile.TemporaryDirectory() as save_directory:
-        json.dump(config_dict, open(os.path.join(save_directory, "config.json"), "w"))
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            json.dump(config_dict, f)
         SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
 
         loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
@@ -176,7 +201,7 @@ def test_from_pretrained_loads_legacy_checkpoint() -> None:
     with torch.no_grad():
         loaded_logits = loaded_model(input_ids=input_ids).logits
 
-    torch.testing.assert_close(loaded_logits, expected_logits)
+    assert_close(loaded_logits, expected_logits)
 
 
 def test_from_pretrained_keeps_decay_gate_params_fp32() -> None:
@@ -211,24 +236,7 @@ def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
     tensors they mark as concatenated."""
 
     torch.manual_seed(42)
-    config_dict = get_hybrid_m2rnn_test_config().to_dict()
-    config_dict["tie_word_embeddings"] = True
-    config_dict["router_aux_loss_coef"] = 0.001
-    config_dict["mlp_blocks"] = [
-        {
-            "mlp_type": "MoE",
-            "activation_function": "swiglu",
-            "add_bias": False,
-            "intermediate_size": 16,
-            "shared_intermediate_size": 32,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "normalized_topk": True,
-            "shared_expert_gating": False,
-            "dropout": 0,
-        }
-        for _ in range(len(config_dict["sequence_mixer_blocks"]))
-    ]
+    config_dict = get_moe_test_config().to_dict()
     model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
     model.eval()
 
@@ -253,7 +261,8 @@ def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
         # use_interleaved_weights_for_shared_experts stays absent, like the released checkpoints
 
     with tempfile.TemporaryDirectory() as save_directory:
-        json.dump(config_dict, open(os.path.join(save_directory, "config.json"), "w"))
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            json.dump(config_dict, f)
         SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
 
         loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
@@ -262,7 +271,7 @@ def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
     with torch.no_grad():
         loaded_logits = loaded_model(input_ids=input_ids).logits
 
-    torch.testing.assert_close(loaded_logits, expected_logits)
+    assert_close(loaded_logits, expected_logits)
 
 
 @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
@@ -275,7 +284,7 @@ def test_logits_to_keep(device: torch.device) -> None:
         full_logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
         sliced_logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=3).logits
 
-    torch.testing.assert_close(sliced_logits, full_logits[:, -3:])
+    assert_close(sliced_logits, full_logits[:, -3:])
 
 
 def test_moe_training_forward_survives_external_torch_distributed() -> None:
@@ -296,45 +305,19 @@ from lm_engine.parallel import ProcessGroupManager
 assert not ProcessGroupManager.is_initialized(), "meshes were never built"
 
 from lm_engine.hf_generation import HFGPTBaseForCausalLM
-from lm_engine.models import GPTBaseConfig
+from tests.hf_generation_test import get_moe_test_config
 
-m2rnn_block = {
-    "sequence_mixer_type": "m2rnn",
-    "k_head_dim": 8, "v_head_dim": 8,
-    "num_q_heads": 1, "num_k_heads": 1, "num_v_heads": 4,
-    "num_f_heads": 4, "num_g_heads": 4, "num_weight_heads": 4,
-    "use_residual": True, "kernel_size": 4, "activation_function": "silu",
-    "add_bias": False, "gradient_clipping": 1.0, "normalization_function": "rmsnorm",
-    "A_init_min": 0, "A_init_max": 16,
-    "dt_init_min": 0.001, "dt_init_max": 0.1, "dt_init_floor": 0.0001,
-}
-moe_block = {
-    "mlp_type": "MoE", "activation_function": "swiglu", "add_bias": False,
-    "intermediate_size": 16, "shared_intermediate_size": 32, "num_experts": 4,
-    "num_experts_per_tok": 2, "normalized_topk": True, "shared_expert_gating": False,
-    "dropout": 0,
-}
-config = GPTBaseConfig(
-    vocab_size=128, max_position_embeddings=64, hidden_size=32, num_layers=2,
-    position_embedding_type="nope", normalization_function="rmsnorm", layer_norm_epsilon=1e-5,
-    embedding_dropout=0, initializer_range=0.02, use_cache=True, rope_theta=10000,
-    rope_scaling=None, init_method="normal", embedding_init_method="normal",
-    use_depth_scaled_init=False, rope_dim=None, tie_word_embeddings=True,
-    router_aux_loss_coef=0.001,
-    bos_token_id=0, eos_token_id=1, pad_token_id=2,
-    m_emb=None, m_width=None, m_residual=None,
-    sequence_mixer_blocks=[m2rnn_block] * 2, mlp_blocks=[moe_block] * 2,
-)
-
-model = HFGPTBaseForCausalLM(config)
+model = HFGPTBaseForCausalLM(get_moe_test_config(num_layers=2))
 model.train()
-input_ids = torch.randint(3, config.vocab_size, (2, 16))
+input_ids = torch.randint(3, model.config.vocab_size, (2, 16))
 loss = model(input_ids=input_ids, labels=input_ids).loss
 assert torch.isfinite(loss), f"non-finite loss {loss}"
 """
 
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = os.environ.copy()
     env.update({"MASTER_ADDR": "localhost", "MASTER_PORT": "29513", "WORLD_SIZE": "1", "RANK": "0"})
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     result = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300, check=False
     )
