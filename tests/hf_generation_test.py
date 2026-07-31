@@ -2,7 +2,6 @@
 # Copyright (c) 2026, Mayank Mishra
 # **************************************************
 
-import json
 import os
 import subprocess
 import sys
@@ -12,76 +11,10 @@ import pytest
 import torch
 from torch.testing import assert_close
 
-from lm_engine.hf_generation import _CONFIG_BACKFILL, HFGPTBaseForCausalLM
+from lm_engine.hf_generation import HFGPTBaseForCausalLM
 from lm_engine.models import GPTBaseConfig, GPTBaseForCausalLM
-from lm_engine.modeling_utils.mlp_blocks.mlp.utils import split_up_gate_tensor_for_mlp
-from lm_engine.utils import SafeTensorsWeightsManager
 
-from .utils import assert_equal_tensors, get_dense_test_config, skip_test_if_device_unavailable
-
-
-def _deinterleave(tensor, dim: int):
-    u, g = split_up_gate_tensor_for_mlp(tensor, dim=dim)
-    return torch.cat([u, g], dim=dim)
-
-
-def get_hybrid_m2rnn_test_config(num_layers: int = 4) -> GPTBaseConfig:
-    """dense test config with all but one layer swapped from attention to m2rnn"""
-
-    config_dict = get_dense_test_config("nope", num_layers=num_layers).to_dict()
-
-    m2rnn_block = {
-        "sequence_mixer_type": "m2rnn",
-        "k_head_dim": 8,
-        "v_head_dim": 8,
-        "num_q_heads": 1,
-        "num_k_heads": 1,
-        "num_v_heads": 4,
-        "num_f_heads": 4,
-        "num_g_heads": 4,
-        "num_weight_heads": 4,
-        "use_residual": True,
-        "kernel_size": 4,
-        "activation_function": "silu",
-        "add_bias": False,
-        "gradient_clipping": 1.0,
-        "normalization_function": "rmsnorm",
-        "A_init_min": 0,
-        "A_init_max": 16,
-        "dt_init_min": 0.001,
-        "dt_init_max": 0.1,
-        "dt_init_floor": 0.0001,
-    }
-
-    config_dict["sequence_mixer_blocks"] = [
-        config_dict["sequence_mixer_blocks"][i] if i == 1 else m2rnn_block for i in range(num_layers)
-    ]
-
-    return GPTBaseConfig(**config_dict)
-
-
-def get_moe_test_config(num_layers: int = 4) -> GPTBaseConfig:
-    """hybrid m2rnn test config with MoE mlp blocks, shaped like the released 7B checkpoints"""
-
-    config_dict = get_hybrid_m2rnn_test_config(num_layers).to_dict()
-    config_dict["tie_word_embeddings"] = True
-    config_dict["router_aux_loss_coef"] = 0.001
-    config_dict["mlp_blocks"] = [
-        {
-            "mlp_type": "MoE",
-            "activation_function": "swiglu",
-            "add_bias": False,
-            "intermediate_size": 16,
-            "shared_intermediate_size": 32,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "normalized_topk": True,
-            "shared_expert_gating": False,
-            "dropout": 0,
-        }
-        for _ in range(num_layers)
-    ]
-    return GPTBaseConfig(**config_dict)
+from .utils import assert_equal_tensors, get_hybrid_m2rnn_test_config, skip_test_if_device_unavailable
 
 
 def _get_model_and_inputs(
@@ -163,47 +96,6 @@ def test_hf_sampled_generate_matches_native(device: torch.device) -> None:
     assert_equal_tensors(hf_output, native_output, exact_match=True)
 
 
-def test_from_pretrained_loads_legacy_checkpoint() -> None:
-    """Checkpoints exported before #465/#478 (like all open-lm-engine hub checkpoints) lack the
-    new config fields and store GLU weights as [up; gate] halves instead of interleaved.
-    from_pretrained must backfill the config and re-interleave the weights."""
-
-    torch.manual_seed(42)
-    config_dict = get_hybrid_m2rnn_test_config().to_dict()
-    config_dict["tie_word_embeddings"] = True
-    for mlp_block in config_dict["mlp_blocks"]:
-        mlp_block["activation_function"] = "swiglu"  # the released checkpoints use GLU MLPs
-    model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
-    model.eval()
-
-    # re-seed so the inputs don't depend on how many RNG draws model construction consumed
-    torch.manual_seed(0)
-    input_ids = torch.randint(3, model.config.vocab_size, (2, 8))
-    with torch.no_grad():
-        expected_logits = model(input_ids=input_ids).logits
-
-    state_dict = model.state_dict()
-    for name in list(state_dict):
-        if name.endswith("mlp_block.c_fc.weight"):
-            state_dict[name] = _deinterleave(state_dict[name], dim=0)
-
-    for key in _CONFIG_BACKFILL:
-        del config_dict[key]
-
-    with tempfile.TemporaryDirectory() as save_directory:
-        with open(os.path.join(save_directory, "config.json"), "w") as f:
-            json.dump(config_dict, f)
-        SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
-
-        loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
-
-    loaded_model.eval()
-    with torch.no_grad():
-        loaded_logits = loaded_model(input_ids=input_ids).logits
-
-    assert_close(loaded_logits, expected_logits)
-
-
 def test_from_pretrained_keeps_decay_gate_params_fp32() -> None:
     """SoftplusDecayGate declares A_log/dt_bias fp32; loading in bf16 must not downcast them
     (the blanket model.to(dtype) in from_pretrained otherwise does)."""
@@ -227,51 +119,6 @@ def test_from_pretrained_keeps_decay_gate_params_fp32() -> None:
     with torch.no_grad():
         logits = loaded_model(input_ids=torch.randint(3, 128, (1, 8))).logits
     assert torch.isfinite(logits.float()).all()
-
-
-def test_from_pretrained_loads_legacy_moe_checkpoint() -> None:
-    """The 7B MoE checkpoints carry pre-#465 per-block interleave flags: routed experts were
-    exported interleaved (use_interleaved_weights: true) while shared experts were not (flag
-    absent = false). from_pretrained must pop the removed flags and convert exactly the
-    tensors they mark as concatenated."""
-
-    torch.manual_seed(42)
-    config_dict = get_moe_test_config().to_dict()
-    model = HFGPTBaseForCausalLM(GPTBaseConfig(**config_dict))
-    model.eval()
-
-    torch.manual_seed(0)
-    input_ids = torch.randint(3, model.config.vocab_size, (2, 8))
-    with torch.no_grad():
-        expected_logits = model(input_ids=input_ids).logits
-
-    # block 0 mimics the 7B checkpoints (routed already interleaved); the rest are fully
-    # legacy — covers both flag values and both tensor layouts (3D routed dim=1, 2D shared dim=0)
-    state_dict = model.state_dict()
-    for name in list(state_dict):
-        if name.endswith("mlp_block.c_fc.weight") and not name.startswith("transformer.h.0."):
-            state_dict[name] = _deinterleave(state_dict[name], dim=1)
-        elif name.endswith("mlp_block.c_fc_shared.weight"):
-            state_dict[name] = _deinterleave(state_dict[name], dim=0)
-
-    for key in _CONFIG_BACKFILL:
-        del config_dict[key]
-    for i, mlp_block in enumerate(config_dict["mlp_blocks"]):
-        mlp_block["use_interleaved_weights"] = i == 0
-        # use_interleaved_weights_for_shared_experts stays absent, like the released checkpoints
-
-    with tempfile.TemporaryDirectory() as save_directory:
-        with open(os.path.join(save_directory, "config.json"), "w") as f:
-            json.dump(config_dict, f)
-        SafeTensorsWeightsManager.save_state_dict(state_dict, save_directory)
-
-        loaded_model = HFGPTBaseForCausalLM.from_pretrained(save_directory)
-
-    loaded_model.eval()
-    with torch.no_grad():
-        loaded_logits = loaded_model(input_ids=input_ids).logits
-
-    assert_close(loaded_logits, expected_logits)
 
 
 @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
@@ -305,9 +152,9 @@ from lm_engine.parallel import ProcessGroupManager
 assert not ProcessGroupManager.is_initialized(), "meshes were never built"
 
 from lm_engine.hf_generation import HFGPTBaseForCausalLM
-from tests.hf_generation_test import get_moe_test_config
+from tests.utils import get_m2rnn_moe_test_config
 
-model = HFGPTBaseForCausalLM(get_moe_test_config(num_layers=2))
+model = HFGPTBaseForCausalLM(get_m2rnn_moe_test_config(num_layers=2))
 model.train()
 input_ids = torch.randint(3, model.config.vocab_size, (2, 16))
 loss = model(input_ids=input_ids, labels=input_ids).loss
